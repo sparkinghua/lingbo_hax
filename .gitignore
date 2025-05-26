@@ -1,3 +1,8 @@
+rtt_test_trace/
+model/
+dataset/
+fcc/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
