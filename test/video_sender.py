@@ -27,7 +27,7 @@ class VideoSender(object):
 
         return int((time.time() - self.init_ts) * 1000)
     def   check_get_rtt(self,action,duration_):
-        get_rtt_thresholds = 3 * self.min_rtt_std / duration_ * 1.5
+        get_rtt_thresholds = 3 * self.min_rtt_std / duration_
         if get_rtt_thresholds > action:
             self.get_rtt_state = False
         return self.get_rtt_state 
@@ -43,7 +43,7 @@ class VideoSender(object):
         if len(new_list) == 0:
             new_list = rtt_list
         return np.mean(new_list), np.std(new_list)
-    def __init__(self, ip, port, model='./model/model.ckpt',queue_flag=0.3, periodic_flag=0):
+    def __init__(self, ip, port, model='./model/model.ckpt',queue_flag=0.3, periodic_flag=0, adaptive_flag=1):
 
         self.init_ts = None
         self.model_path = model
@@ -79,7 +79,7 @@ class VideoSender(object):
         self.sent_bytes = 0
 
         self.min_rtt = float('inf')
-        self.min_rtt_std = None
+        self.min_rtt_std = 0.0
         self.min_rtts = []
         self.delay_ewma = None
         self.send_rate_ewma = None
@@ -109,11 +109,19 @@ class VideoSender(object):
         self.curr_bytes, self.curr_delay = [], []
         self.loss_count=0
         self.queue_flag = float(queue_flag)
-        self.periodic_flag = periodic_flag 
-        self.f = open('/home/jlc/pantheon/YiTian/motivation/log/23/lingbo_1.log','w')
+        self.periodic_flag = periodic_flag
+        self.adaptive_flag = adaptive_flag
+        sys.stderr = open('/home/jlc/pantheon/test_datas/lingbo_hax/tmp12/lingbo_hax.log','w')
         self.random_time = 5000
-
-
+        
+        #adaptive parameters
+        self.current_interval = 10 * 1000     # current RTT probe interval
+        self.theta1 = 3.0                     # delay / min_rtt_std threshold for positive delay outliers
+        self.theta2 = 2.0                     # delay / min_rtt_std threshold for negative delay outliers
+        self.patience = 0                     # patience for the delay outliers
+        self.last_pat_sign = 0                # last patience signal
+        self.max_patience = 5                 # maximum patience for the delay outliers
+        
     def cleanup(self):
         self.sock.close()
 
@@ -223,7 +231,7 @@ class VideoSender(object):
     def take_action(self, action_idx):
         action_idx = np.clip(action_idx, -1., 1.)
         self.cwnd = (1. + action_idx) * self.cwnd
-        self.f.write('cwnd: ' + str(self.cwnd) + '\n')
+        # self.f.write('cwnd: ' + str(self.cwnd) + '\n')
         self.cwnd = np.clip(self.cwnd, 2.0, 5000.0)
         random_factor = 1
 
@@ -232,7 +240,7 @@ class VideoSender(object):
         #     random_factor = 0.8
         #     self.cwnd = self.cwnd * random_factor 
         #     self.random_time = 1e9+7
-        self.f.write('random cwnd: ' + str(self.cwnd) + ' random factor: ' + str(random_factor) + ' time: ' + str(curr_time) + '\n')
+        # self.f.write('random cwnd: ' + str(self.cwnd) + ' random factor: ' + str(random_factor) + ' time: ' + str(curr_time) + '\n')
 
 
     def window_is_open(self):
@@ -317,6 +325,12 @@ class VideoSender(object):
             
   
             state, action, prob = self.step(s, duration_)
+            sys.stderr.write('+' * 50 + '\ntime: ' + str(self.curr_ts_ms()//1000) + 's' + '\n')
+            sys.stderr.write('action: ' + str(action) + '\n')
+            sys.stderr.write('delay ewma: ' + str(self.delay_ewma) + ' delivery rate ewma: ' + str(self.delivery_rate_ewma) + ' send rate ewma: ' + str(self.send_rate_ewma) + '\n')
+            sys.stderr.write('min rtt: ' + str(self.min_rtt) + ' min rtt std: ' + str(self.min_rtt_std) + '\n')
+            sys.stderr.write('patience: ' + str(self.patience) + '\n')
+            sys.stderr.write('cwnd: ' + str(self.cwnd) + '\n')
             if self.get_rtt_state:
                 
                 if self.check_get_rtt(action,duration_):
@@ -344,7 +358,27 @@ class VideoSender(object):
                         self.queue_flag]
 
                 state, action, prob = self.step(s, duration_)
-                    
+                
+            if not self.get_rtt_state and self.delay_ewma:
+                if self.last_pat_sign == 0:
+                    if self.delay_ewma > self.theta1 * self.min_rtt_std:
+                        self.patience += 1
+                        self.last_pat_sign = 1
+                    elif self.delay_ewma < -self.theta2 * self.min_rtt_std:
+                        self.patience += 1
+                        self.last_pat_sign = -1
+                    else:
+                        self.patience = 0
+                else:
+                    if self.last_pat_sign == 1 and self.delay_ewma > self.theta1 * self.min_rtt_std:
+                        self.patience += 1
+                    elif self.last_pat_sign == -1 and self.delay_ewma < -self.theta2 * self.min_rtt_std:
+                        self.patience += 1
+                    else:
+                        self.patience = 0
+                        self.last_pat_sign = 0
+            else:
+                self.patience = 0
                
 
 
@@ -368,16 +402,36 @@ class VideoSender(object):
                 self.running = False
                 self.done = True
 
-        if self.periodic_flag and self.curr_ts_ms() - self.last_send_time  > 10*1000 and self.get_rtt_state == False:
-         
-            self.init_state = True
-            self.judge_state = False
-            self.tmp_rtts = []
-            self.min_rtts = []
-            self.get_rtt_state = True
-            self.cwnd = self.cwnd * (self.min_rtt/(2*self.min_rtt+3*self.min_rtt_std))
-            self.last_send_time = self.curr_ts_ms()
-
+        if self.periodic_flag and self.get_rtt_state == False:
+            if self.adaptive_flag:
+                if (self.patience >= self.max_patience):
+                    self.init_state = True
+                    self.judge_state = False
+                    self.tmp_rtts = []
+                    self.min_rtts = []
+                    self.get_rtt_state = True
+                    sys.stderr.write('0'*50 + '\ndecrease cwnd at time: ' + str(self.curr_ts_ms()//1000) + 's: ' + 'ratio: ' + str((self.min_rtt/(2*self.min_rtt+3*self.min_rtt_std))) + '\n')
+                    sys.stderr.write('min rtt: ' + str(self.min_rtt) + ' min rtt std: ' + str(self.min_rtt_std) + '\n')
+                    sys.stderr.write('before cwnd: ' + str(self.cwnd) + '\n')
+                    self.cwnd = self.cwnd * (duration_/(2*duration_+6*self.min_rtt_std))
+                    sys.stderr.write('after cwnd: ' + str(self.cwnd) + '\n')
+                    self.last_send_time = self.curr_ts_ms()
+                    self.patience = 0
+                    self.delay_ewma = None
+            else:
+                if self.curr_ts_ms() - self.last_send_time  > self.current_interval:
+                    self.init_state = True
+                    self.judge_state = False
+                    self.tmp_rtts = []
+                    self.min_rtts = []
+                    self.get_rtt_state = True
+                    sys.stderr.write('0'*50 + '\ndecrease cwnd at time: ' + str(self.curr_ts_ms()//1000) + 's: ' + 'ratio: ' + str((self.min_rtt/(2*self.min_rtt+3*self.min_rtt_std))) + '\n')
+                    sys.stderr.write('min rtt: ' + str(self.min_rtt) + ' min rtt std: ' + str(self.min_rtt_std) + '\n')
+                    sys.stderr.write('before cwnd: ' + str(self.cwnd) + '\n')
+                    self.cwnd = self.cwnd * (self.min_rtt/(2*self.min_rtt+3*self.min_rtt_std))
+                    sys.stderr.write('after cwnd: ' + str(self.cwnd) + '\n')
+                    self.last_send_time = self.curr_ts_ms()
+    
     def run(self):
         VIDEO_CHUNK_COUNT = 1
         MAX_SEND_CHUNK_SIZE = 1.
